@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 
 import prodius_mcp
 
@@ -15,22 +16,27 @@ import prodius_mcp
 SHIM = [sys.executable, "-m", "prodius_mcp"]
 
 
+_ENV = {
+    "PRODIUS_MCP_TOKEN": "test-token-abc",
+    "PRODIUS_BASE_URL": "http://127.0.0.1:1",  # unreachable
+    "PRODIUS_AGENT_NAME": "Test Agent",
+}
+
+
 def _run_shim(messages: list[str], timeout: float = 20.0) -> list[dict]:
-    """Send NDJSON messages to the shim and return parsed responses."""
+    """Send NDJSON messages to the shim, close stdin, return parsed responses.
+
+    Closing stdin gives in-flight tool calls only a short grace period, so
+    use _await_response() for calls that must reach the (unreachable) bridge.
+    """
     stdin_data = "\n".join(messages) + "\n"
-    env = {
-        **os.environ,
-        "PRODIUS_MCP_TOKEN": "test-token-abc",
-        "PRODIUS_BASE_URL": "http://127.0.0.1:1",  # unreachable, fast fail
-        "PRODIUS_AGENT_NAME": "Test Agent",
-    }
     result = subprocess.run(
         SHIM,
         input=stdin_data,
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=env,
+        env={**os.environ, **_ENV},
     )
     responses = []
     for line in result.stdout.strip().split("\n"):
@@ -38,6 +44,31 @@ def _run_shim(messages: list[str], timeout: float = 20.0) -> list[dict]:
         if line:
             responses.append(json.loads(line))
     return responses
+
+
+def _await_response(messages: list[str], want_id, timeout: float = 30.0) -> dict:
+    """Send messages with stdin held open until the response to ``want_id``.
+
+    A real client keeps stdin open while it waits. That matters on Windows,
+    where even a refused loopback connection takes about two seconds.
+    """
+    proc = subprocess.Popen(SHIM, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, env={**os.environ, **_ENV})
+    timer = threading.Timer(timeout, proc.kill)
+    timer.start()
+    try:
+        proc.stdin.write("\n".join(messages) + "\n")
+        proc.stdin.flush()
+        for line in proc.stdout:
+            if line.strip():
+                msg = json.loads(line)
+                if msg.get("id") == want_id:
+                    return msg
+        raise AssertionError(f"no response with id {want_id}")
+    finally:
+        timer.cancel()
+        proc.stdin.close()
+        proc.wait(timeout=10)
 
 
 def _msg(method: str, msg_id=None, params=None) -> str:
@@ -219,11 +250,10 @@ class TestToolCall:
 
     def test_notify_with_unreachable_server(self):
         """notify to unreachable server returns connection error in tool result."""
-        responses = _run_shim([
+        tool_resp = _await_response([
             _msg("initialize", 1),
             _msg("tools/call", 2, {"name": "notify", "arguments": {"message": "hello"}}),
-        ])
-        tool_resp = [r for r in responses if r.get("id") == 2][0]
+        ], want_id=2)
         result = tool_resp["result"]
         assert result["isError"] is True
         content_text = result["content"][0]["text"]
@@ -233,14 +263,13 @@ class TestToolCall:
 
     def test_ask_user_with_unreachable_server(self):
         """ask_user to unreachable server returns connection error."""
-        responses = _run_shim([
+        tool_resp = _await_response([
             _msg("initialize", 1),
             _msg("tools/call", 2, {
                 "name": "ask_user",
                 "arguments": {"question": "test?", "task_name": "Test"},
             }),
-        ])
-        tool_resp = [r for r in responses if r.get("id") == 2][0]
+        ], want_id=2)
         content_text = tool_resp["result"]["content"][0]["text"]
         error_data = json.loads(content_text)
         assert "Cannot connect" in error_data["error"]
